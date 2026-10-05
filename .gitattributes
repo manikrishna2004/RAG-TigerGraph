@@ -1,0 +1,2 @@
+db/chroma_db/chroma.sqlite3 filter=lfs diff=lfs merge=lfs -text
+bm25_index.pkl filter=lfs diff=lfs merge=lfs -text

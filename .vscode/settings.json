@@ -1,0 +1,5 @@
+{
+    "python.analysis.extraPaths": [
+        "C:\\Users\\bmani\\anaconda3\\Lib\\site-packages"
+    ]
+}
