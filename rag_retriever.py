@@ -49,7 +49,12 @@ def get_reranker() -> CrossEncoder:
     """Lazy-load the cross-encoder reranker optimized for CPU execution."""
     global _RERANKER
     if _RERANKER is None:
-        torch.set_num_threads(4)
+        # 1. Auto-detect if your laptop GPU is available
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        # 2. Only restrict CPU threads if we are actually forced to use the CPU
+        if device == "cpu":
+            torch.set_num_threads(4)
         print(f"  [Reranker] Loading '{RERANKER_MODEL_NAME}' on CPU (Threads=4, MaxLength=256)...")
         _RERANKER = CrossEncoder(
             RERANKER_MODEL_NAME, 

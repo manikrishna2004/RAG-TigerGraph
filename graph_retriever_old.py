@@ -1,29 +1,29 @@
-import argparse
+import os
 import re
+from collections import defaultdict
+from typing import Any, Dict, List, Optional
+
+import torch
+from sentence_transformers import CrossEncoder
 from tg_connection import get_tg_connection
-print(get_tg_connection().getSchema()["EdgeTypes"])
 
-# --- TigerGraph-backed graph retrieval -------------------------------------------------------
-# Reads the graph graph_builder.py writes: vertex type "Entity" (id = entity name, no attributes),
-# edge type "Relation" with attributes relation / source_file / chunk_id.
-# Same public functions and return shape as the old .gml version, so agent_orchestrator.py is unchanged.
-
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 VERTEX_TYPE = "Entity"
-EDGE_LIMIT_PER_NODE = 500      # bounds hub nodes (one REST call per node)
-MAX_SEED_CANDIDATES = 30       # entity-name matches we fetch edges for, before keeping the best max_entities
-MAX_EXPAND_NODES = 25          # neighbours expanded on hop 2 (only reached if hop 1 gave < max_facts)
+CHUNK_TYPE = "Chunk"
+EDGE_LIMIT_PER_NODE = 300        
+MAX_SEED_ENTITIES = 7           
+MAX_CANDIDATE_CHUNKS = 25        
+RERANKER_MODEL_NAME = "BAAI/bge-reranker-base"
 
 _CONN = None
-_NODE_NAMES = None             # all Entity ids, loaded once
-_EDGE_CACHE = {}               # node -> list of edge records
+_NODE_NAMES = None
+_RERANKER = None
+_EDGE_CACHE = {}
 
-# Words that are capitalized in questions but are never entities (fallback matcher only).
-_STOPWORDS = {
-    "what", "who", "whom", "whose", "which", "when", "where", "why", "how", "did", "does", "do",
-    "is", "are", "was", "were", "the", "and", "for", "with", "from", "that", "this", "these",
-    "those", "tell", "list", "name", "give", "show", "explain", "describe", "compare", "won",
-    "win", "has", "have", "had", "can", "could", "would", "should", "about", "between",
-}
+# Expanded stopword list to prevent generic matches grabbing the whole graph
+_GLUE = {"at", "the", "of", "in", "and", "for", "a", "an", "on", "to", "by", "with", "who", "what", "where", "when", "how", "many", "which"}
 
 
 def _conn():
@@ -33,244 +33,245 @@ def _conn():
     return _CONN
 
 
-def _get_node_names():
-    """All Entity ids, loaded once per process (needed for question -> entity matching)."""
+def get_reranker() -> CrossEncoder:
+    global _RERANKER
+    if _RERANKER is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        if device == "cpu":
+            torch.set_num_threads(4)
+        print(f"  [Pure GraphRAG] Loading Reranker '{RERANKER_MODEL_NAME}' on {device.upper()}...")
+        _RERANKER = CrossEncoder(RERANKER_MODEL_NAME, max_length=256, device=device)
+    return _RERANKER
+
+
+def _get_node_names() -> List[str]:
     global _NODE_NAMES
     if _NODE_NAMES is None:
         conn = _conn()
-        count = conn.getVertexCount(VERTEX_TYPE)
-        verts = conn.getVertices(VERTEX_TYPE, limit=max(int(count), 1))
-        _NODE_NAMES = [v["v_id"] for v in verts]
-        print(f"  [Graph] Loaded {len(_NODE_NAMES)} entity names from TigerGraph")
+        try:
+            count = conn.getVertexCount(VERTEX_TYPE)
+            verts = conn.getVertices(VERTEX_TYPE, limit=max(int(count), 1))
+            _NODE_NAMES = [v["v_id"] for v in verts]
+        except Exception as e:
+            print(f"  [Pure GraphRAG Error] Failed to fetch entity vertices: {e}")
+            _NODE_NAMES = []
     return _NODE_NAMES
 
 
 def _norm(text: str) -> str:
-    return re.sub(r"[^a-z0-9]+", " ", str(text).lower()).strip()
+    text = re.sub(r"['’`]", "", str(text).lower())
+    return re.sub(r"[^a-z0-9]+", " ", text).strip()
 
 
-def _edge_record(u, v, data):
-    relation = data.get("relation", "connected_to")
-    return {
-        "source": u,
-        "target": v,
-        "relation": relation,
-        "source_file": data.get("source_file", "unknown"),
-        "chunk_id": data.get("chunk_id", "unknown"),
-        "fact_str": f"{u} --[{relation}]--> {v}",
-    }
+# ---------------------------------------------------------------------------
+# Aggressive Entity Linking 
+# ---------------------------------------------------------------------------
+def find_entities_in_question(question: str, max_entities: int = MAX_SEED_ENTITIES) -> List[str]:
+    names = _get_node_names()
+    if not names:
+        return []
+
+    q_norm = f" {_norm(question)} "
+    q_toks = set(_norm(question).split()) - _GLUE
+
+    scored_matches = []
+    for node in names:
+        n_norm = _norm(node)
+        if not n_norm or len(n_norm) < 2:
+            continue
+        
+        # 1. Exact Substring Boost
+        if f" {n_norm} " in q_norm:
+            scored_matches.append((node, 10.0 + len(n_norm)))
+            continue
+            
+        # 2. Token Overlap Scoring
+        n_toks = set(n_norm.split()) - _GLUE
+        if not n_toks:
+            continue
+            
+        overlap = len(n_toks & q_toks)
+        overlap_ratio = overlap / len(n_toks)
+        
+        if overlap_ratio >= 0.4:
+            scored_matches.append((node, overlap_ratio * len(n_norm)))
+
+    scored_matches.sort(key=lambda x: x[1], reverse=True)
+    
+    seen = set()
+    final_seeds = []
+    for node, _ in scored_matches:
+        if node not in seen:
+            seen.add(node)
+            final_seeds.append(node)
+            
+    return final_seeds[:max_entities]
 
 
-def _edges_of(node):
-    """All edges touching `node` (cached). Queries every edge type on the vertex so a
-    REVERSE_EDGE, if the schema has one, brings incoming edges too; reverse edges are
-    flipped back to their original direction."""
+# ---------------------------------------------------------------------------
+# Traversal & Fetching
+# ---------------------------------------------------------------------------
+def _edges_of(node: str) -> List[Dict[str, Any]]:
     if node in _EDGE_CACHE:
         return _EDGE_CACHE[node]
     records = []
     try:
         edges = _conn().getEdges(VERTEX_TYPE, node, limit=EDGE_LIMIT_PER_NODE)
-    except Exception as e:
-        print(f"  [Graph] Edge fetch failed for '{node}': {e}")
+    except Exception:
         edges = []
+
     for e in edges:
-        etype = e.get("e_type", "")
+        if not isinstance(e, dict):
+            continue
+
+        etype = str(e.get("e_type", ""))
         if "relation" not in etype.lower():
             continue
+        
         u, v = e.get("from_id"), e.get("to_id")
         if etype.lower().startswith("reverse"):
             u, v = v, u
-        records.append(_edge_record(u, v, e.get("attributes", {})))
+
+        attrs = e.get("attributes", {})
+        if not isinstance(attrs, dict):
+            attrs = {}
+
+        records.append({
+            "source": u,
+            "target": v,
+            "relation": attrs.get("relation", "connected_to"),
+            "chunk_id": attrs.get("chunk_id", "unknown"),
+        })
     _EDGE_CACHE[node] = records
     return records
 
 
-def find_entities_in_question(question: str, max_entities: int = 8):
-    """Extract and rank graph entities from a natural language question.
-    
-    1. Exact Substring Match: Prefers longer, specific entity names over generic tokens.
-    2. Specificity Scoring: Sorts candidates by word count & character length, then degree count.
-    """
-    names = _get_node_names()
-    q_norm = f" {_norm(question)} "
-
-    hits = []
-    for node in names:
-        n = _norm(node)
-        if len(n) >= 3 and n not in _STOPWORDS and f" {n} " in q_norm:
-            hits.append(node)
-
-    # Remove candidate hits that are completely contained inside a longer candidate hit
-    # e.g., keep "2012 Summer Olympics", drop "Olympics"
-    hits = [
-        h for h in hits
-        if not any(h != o and f" {_norm(h)} " in f" {_norm(o)} " for o in hits)
-    ]
-
-# Fuzzy ratio fallback if exact substring matches yield fewer than 2 candidates
-    if len(hits) < 2:
-        from difflib import SequenceMatcher
-        q_tokens = [t for t in _norm(question).split() if t not in _STOPWORDS and len(t) > 3]
-        for node in names:
-            n_norm = _norm(node)
-            ratio = SequenceMatcher(None, n_norm, _norm(question)).ratio()
-            if ratio > 0.65 or any(SequenceMatcher(None, n_norm, t).ratio() > 0.85 for t in q_tokens):
-                if node not in hits:
-                    hits.append(node)
-
-    # Fallback to token matching if no exact long phrases match
-    if not hits:
-        tokens = {t.lower() for t in re.findall(r"\b[A-Z][A-Za-z0-9'\-]{2,}\b", question)} - _STOPWORDS
-        if tokens:
-            for node in names:
-                node_toks = set(_norm(node).split())
-                if tokens & node_toks:
-                    hits.append(node)
-
-    hits = hits[:MAX_SEED_CANDIDATES]
-
-    # Rank by specificity (number of words & total length) first, then by edge connectivity
-    def _specificity_score(entity_name: str) -> float:
-        norm_name = _norm(entity_name)
-        word_count = len(norm_name.split())
-        char_len = len(norm_name)
-        edge_count = len(_edges_of(entity_name))
+def _fetch_graph_chunks(ids: List[str]) -> Dict[str, str]:
+    out = {}
+    if not ids:
+        return out
         
-        # Balance specificity (longer phrases) against graph degree
-        return (word_count * 10.0) + (char_len * 0.5) + min(edge_count, 50)
-
-    hits.sort(key=_specificity_score, reverse=True)
-    return hits[:max_entities]
-
-
-def _expand(seeds, max_depth: int, max_facts: int):
-    """BFS out from the seeds, undirected. Edges touching a seed come first (direct)."""
-    seed_set = set(seeds)
-    seen, direct, indirect = set(), [], []
-    visited = set(seeds)
-    frontier = list(seeds)
-
-    for depth in range(max_depth):
-        if depth > 0 and len(direct) >= max_facts:
-            break  # hop-2 facts would be cut off by max_facts anyway; skip the extra REST calls
-        next_frontier = []
-        for node in frontier:
-            for rec in _edges_of(node):
-                key = (rec["source"], rec["target"], rec["relation"])
-                if key not in seen:
-                    seen.add(key)
-                    touches_seed = rec["source"] in seed_set or rec["target"] in seed_set
-                    (direct if touches_seed else indirect).append(rec)
-                other = rec["target"] if rec["source"] == node else rec["source"]
-                if other not in visited:
-                    visited.add(other)
-                    next_frontier.append(other)
-        frontier = next_frontier[:MAX_EXPAND_NODES]
-        if not frontier:
-            break
-
-    return (direct + indirect)[:max_facts]
-
-
-def search_question_subgraph(question: str, max_depth: int = 2, graph_path: str = None, max_facts: int = 60):
-    """Question-level graph retrieval: find entities mentioned in a full question, then return
-    their n-hop neighbourhood from TigerGraph. This is what the orchestrator calls.
-
-    `graph_path` is accepted only so agent_orchestrator.py's call keeps working; it is ignored
-    (there is no .gml file any more).
-    """
+    conn = _conn()
+    clean_ids = [cid.split("::")[-1] if "::" in cid else cid for cid in ids]
+    
+    verts = None
     try:
-        seeds = find_entities_in_question(question)
-    except Exception as e:
-        print(f"  [Graph] TigerGraph lookup failed: {e}")
-        return []
-
-    if not seeds:
-        print(f"  [Graph] No entities from the question found in graph: '{question}'")
-        return []
-    print(f"  [Graph] Matched entities: {seeds}")
-
-    return _expand(seeds, max_depth, max_facts)
-
-
-def search_entity_subgraph(query_entity: str, max_depth: int = 2, graph_path: str = None, max_facts: int = 60):
-    """n-hop traversal around an entity NAME (not a full question)."""
-    try:
-        names = _get_node_names()
-    except Exception as e:
-        print(f"  [Graph] TigerGraph lookup failed: {e}")
-        return []
-
-    query_norm = query_entity.strip().title()
-    matching = [n for n in names if query_norm in n or n in query_norm][:MAX_SEED_CANDIDATES]
-    if not matching:
-        print(f"No direct entity match found for: '{query_entity}'")
-        return []
-
-    return _expand(matching, max_depth, max_facts)
-
-
-def search_entities_subgraph(entities: list, max_depth: int = 2, max_facts: int = 60):
-    """Graph traversal seeded by an explicit list of entity names.
-
-    Called by the orchestrator when vector retrieval surfaces entities not present
-    in the original question — enabling the multi-hop pattern:
-        vector_search → extract entities → graph_traversal → answer.
-
-    Each name is fuzzy-matched against known graph entities (case-insensitive
-    substring), up to 3 matches per input name, then deduplicated before BFS.
-    Falls back gracefully if the entity list is empty or no matches are found.
-    """
-    if not entities:
-        return []
-
-    try:
-        names = _get_node_names()
-    except Exception as e:
-        print(f"  [Graph] TigerGraph lookup failed: {e}")
-        return []
-
-    seeds = []
-    for entity in entities:
-        if not entity:
+        verts = conn.getVerticesById(CHUNK_TYPE, ids)
+    except Exception:
+        pass
+        
+    if not verts:
+        try:
+            verts = conn.getVerticesById(CHUNK_TYPE, clean_ids)
+        except Exception as e:
+            print(f"  [Pure GraphRAG Error] Both ID formats failed validation: {e}")
+            verts = []
+            
+    if isinstance(verts, dict):
+        verts = [verts]
+        
+    for v in (verts or []):
+        if not isinstance(v, dict):
             continue
-        # Sanitize single quotes safely for query processing
-        sanitized_entity = str(entity).replace("'", "\\'")
-        norm = sanitized_entity.strip().lower()
-        matching = [n for n in names
-                    if norm in n.lower() or n.lower() in norm]
-        seeds.extend(matching[:3])
+        attrs = v.get("attributes", {})
+        if isinstance(attrs, dict):
+            content = str(attrs.get("content", ""))
+            v_id = str(v.get("v_id", ""))
+            
+            if content and v_id:
+                out[v_id] = content
+                out[f"corpus.jsonl::{v_id}"] = content
+                
+    return out
 
-    # Deduplicate while preserving order, then cap
-    seen_s, unique_seeds = set(), []
-    for s in seeds:
-        if s not in seen_s:
-            seen_s.add(s)
-            unique_seeds.append(s)
-    unique_seeds = unique_seeds[:MAX_SEED_CANDIDATES]
 
-    if not unique_seeds:
-        print(f"  [Graph] No graph entities matched from seed list: {entities}")
+# ---------------------------------------------------------------------------
+# REQUIRED FIX: Entity Attribute Extractor
+# ---------------------------------------------------------------------------
+def attributes_text(nodes: List[str]) -> str:
+    """Extract entity attributes directly from TigerGraph Entity vertices for Context."""
+    if not nodes:
+        return ""
+    out = []
+    try:
+        verts = _conn().getVerticesById(VERTEX_TYPE, list(nodes))
+        if isinstance(verts, dict):
+            verts = [verts]
+        for v in (verts or []):
+            if not isinstance(v, dict):
+                continue
+            attrs_obj = v.get("attributes")
+            attrs = attrs_obj if isinstance(attrs_obj, dict) else {}
+            # Filter out empty values and internal IDs
+            filtered_attrs = {k: val for k, val in attrs.items() if val and k != "v_id"}
+            if filtered_attrs:
+                v_id = v.get("v_id")
+                out.append(f"{v_id}: " + ", ".join(f"{k}={val}" for k, val in filtered_attrs.items()))
+    except Exception:
+        pass
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# Core Pipeline
+# ---------------------------------------------------------------------------
+def graph_chunk_search(question: str, max_chunks: int = 5, seeds: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    seeds = seeds if seeds is not None else find_entities_in_question(question)
+    if not seeds:
+        print(f"  [Pure GraphRAG] No entity vertices matched in graph for: '{question}'")
         return []
 
-    print(f"  [Graph] Entity-seeded traversal from: {unique_seeds}")
-    return _expand(unique_seeds, max_depth, max_facts)
+    print(f"  [Pure GraphRAG] Traversing TigerGraph subgraphs from seed entities: {seeds}")
 
+    score_map, via_map = defaultdict(float), defaultdict(set)
+    for rank, s in enumerate(seeds):
+        weight = 1.0 / (1.0 + 0.5 * rank)
+        for r in _edges_of(s):
+            cid = r["chunk_id"]
+            if cid and cid != "unknown":
+                score_map[cid] += weight
+                via_map[cid].add(s)
 
-def main():
-    parser = argparse.ArgumentParser(description="Query the knowledge graph (TigerGraph)")
-    parser.add_argument("entity", nargs="*", help="The entity (or full question) to search for")
-    parser.add_argument("--question", action="store_true",
-                        help="Treat the input as a full natural-language question (same path the orchestrator uses).")
-    args = parser.parse_args()
+    if not score_map:
+        print(f"  [Pure GraphRAG] No chunk vertices connected to seeds: {seeds}")
+        return []
 
-    entity = " ".join(args.entity) if args.entity else input("Enter an entity to search in Graph: ")
+    candidate_ids = sorted(score_map, key=score_map.get, reverse=True)[:MAX_CANDIDATE_CHUNKS]
+    texts_map = _fetch_graph_chunks(candidate_ids)
 
-    results = search_question_subgraph(entity) if args.question else search_entity_subgraph(entity)
-    print(f"\nFound {len(results)} relationships for '{entity}':")
-    for r in results:
-        print(f" - {r['fact_str']}  [chunk: {r['chunk_id']}]")
+    if not texts_map:
+        print(f"  [Pure GraphRAG] No content attributes found on target chunk vertices.")
+        return []
 
+    candidates = []
+    pairs = []
+    cid_list = []
 
-if __name__ == "__main__":
-    main()
+    for cid in candidate_ids:
+        if cid in texts_map:
+            pairs.append([question, texts_map[cid]])
+            cid_list.append(cid)
+
+    if not pairs:
+        return []
+
+    reranker = get_reranker()
+    raw_scores = reranker.predict(pairs, batch_size=16, show_progress_bar=False)
+
+    max_graph_score = max(score_map.values()) if score_map.values() else 1.0
+
+    for cid, raw_score in zip(cid_list, raw_scores):
+        rerank_score = 1.0 / (1.0 + torch.exp(torch.tensor(-float(raw_score))).item())
+        graph_norm = score_map[cid] / max_graph_score
+        
+        combined_score = (0.60 * rerank_score) + (0.40 * graph_norm)
+
+        candidates.append({
+            "chunk_id": cid,
+            "content": texts_map[cid],
+            "graph_score": round(combined_score, 4),
+            "seeds": sorted(via_map[cid])
+        })
+
+    candidates.sort(key=lambda x: x["graph_score"], reverse=True)
+    return candidates[:max_chunks]
